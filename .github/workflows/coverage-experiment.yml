@@ -1,0 +1,179 @@
+name: Coverage Experiment
+
+# Compares the current grcov setup in rust-tests.yml with cargo-llvm-cov.
+# "warm" jobs first build the base commit in the same target directory,
+# to mimic a pull request restoring the default branch's build cache.
+
+on:
+  push:
+    branches: [coverage-experiment]
+  workflow_dispatch:
+
+env:
+  BASE_SHA: 1dc0a6b85b4ff96ba1b8b5e738173fd69004bee5
+
+jobs:
+  grcov:
+    name: grcov (${{ matrix.cache }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cache: [cold, warm]
+    env:
+      RUSTC_WORKSPACE_WRAPPER: ${{ github.workspace }}/.github/scripts/rustc-workspace-wrapper.sh
+      LLVM_PROFILE_FILE: ${{ github.workspace }}/target/llvm-profiles/rust-unit/sail-%p-%m.profraw
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/adjust-swap-space
+
+      - uses: ./.github/actions/mount-target-directory
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      - name: Install tools
+        run: rustup toolchain install stable --profile default --component llvm-tools-preview
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: grcov,cargo-nextest
+
+      - name: Show versions
+        run: |
+          rustc -vV
+          grcov --version
+          cargo nextest --version
+          mkdir -p out
+
+      - name: Build and test base commit
+        if: ${{ matrix.cache == 'warm' }}
+        run: |
+          git checkout --detach "$BASE_SHA"
+          start=$SECONDS
+          cargo nextest run --no-fail-fast || true
+          echo "base_test_seconds=$((SECONDS - start))" >> out/timings.txt
+          git checkout --detach "$GITHUB_SHA"
+          rm -rf target/llvm-profiles
+
+      - name: Run tests
+        run: |
+          mkdir -p target/llvm-profiles/rust-unit
+          start=$SECONDS
+          cargo nextest run --no-fail-fast || echo "tests_failed=true" >> out/timings.txt
+          echo "test_seconds=$((SECONDS - start))" >> out/timings.txt
+
+      - name: Generate reports
+        run: |
+          LLVM_PATH=$(.github/scripts/find-llvm-profdata.sh)
+          start=$SECONDS
+          grcov target/llvm-profiles/rust-unit --binary-path target/debug/ -s . \
+            --llvm-path "$LLVM_PATH" \
+            -t lcov --branch --ignore-not-existing \
+            -o out/grcov-all.info
+          echo "report_all_seconds=$((SECONDS - start))" >> out/timings.txt
+
+          mkdir -p target/nextest-bins
+          cargo nextest list --list-type binaries-only --message-format json > out/nextest-binaries.json
+          jq -r '."rust-suites"[]."binary-path"' out/nextest-binaries.json | xargs -I{} ln -f {} target/nextest-bins/
+          start=$SECONDS
+          grcov target/llvm-profiles/rust-unit --binary-path target/nextest-bins/ -s . \
+            --llvm-path "$LLVM_PATH" \
+            -t lcov --branch --ignore-not-existing \
+            -o out/grcov-exact.info
+          echo "report_exact_seconds=$((SECONDS - start))" >> out/timings.txt
+
+      - name: Record build artefacts
+        run: |
+          find target/debug/deps -maxdepth 1 -type f -perm -u+x -printf '%TY-%Tm-%Td %TT %s %f\n' | sort -k4 > out/executables.txt
+          ls target/nextest-bins > out/nextest-bins.txt
+          wc -l out/executables.txt out/nextest-bins.txt
+          grep sail_telemetry out/executables.txt || true
+          du -sh target/ | tee -a out/timings.txt
+          cat out/timings.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: grcov-${{ matrix.cache }}
+          path: out/
+
+  llvm-cov:
+    name: llvm-cov (${{ matrix.cache }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cache: [cold, warm]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/adjust-swap-space
+
+      - uses: ./.github/actions/mount-target-directory
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ github.token }}
+
+      - name: Install tools
+        run: rustup toolchain install stable --profile default --component llvm-tools-preview
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
+
+      - name: Show versions
+        run: |
+          rustc -vV
+          cargo llvm-cov --version
+          cargo nextest --version
+          mkdir -p out
+
+      - name: Build and test base commit
+        if: ${{ matrix.cache == 'warm' }}
+        run: |
+          git checkout --detach "$BASE_SHA"
+          start=$SECONDS
+          cargo llvm-cov nextest --no-fail-fast --lcov --output-path out/llvm-cov-base.info || true
+          echo "base_test_seconds=$((SECONDS - start))" >> out/timings.txt
+          git checkout --detach "$GITHUB_SHA"
+
+      - name: Run tests
+        run: |
+          start=$SECONDS
+          cargo llvm-cov nextest --no-fail-fast --lcov --output-path out/llvm-cov.info \
+            || echo "tests_failed=true" >> out/timings.txt
+          echo "test_seconds=$((SECONDS - start))" >> out/timings.txt
+
+      - name: Generate report with build scripts
+        run: |
+          start=$SECONDS
+          cargo llvm-cov report --lcov --include-build-script --output-path out/llvm-cov-build-scripts.info
+          echo "report_build_scripts_seconds=$((SECONDS - start))" >> out/timings.txt
+
+      - name: Record build artefacts
+        run: |
+          find target -path '*/deps/*' -maxdepth 4 -type f -perm -u+x -printf '%TY-%Tm-%Td %TT %s %p\n' | sort -k4 > out/executables.txt
+          wc -l out/executables.txt
+          grep sail_telemetry out/executables.txt || true
+          du -sh target/ | tee -a out/timings.txt
+          cat out/timings.txt
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: llvm-cov-${{ matrix.cache }}
+          path: out/
