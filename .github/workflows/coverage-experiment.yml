@@ -28,6 +28,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
       - uses: ./.github/actions/adjust-swap-space
 
       - uses: ./.github/actions/mount-target-directory
@@ -63,6 +68,9 @@ jobs:
           echo "base_test_seconds=$((SECONDS - start))" >> out/timings.txt
           git checkout --detach "$GITHUB_SHA"
           rm -rf target/llvm-profiles
+          # The real build cache only keeps `build/`, `deps/`, and `.fingerprint/`.
+          rm -rf target/debug/incremental
+          df -h /
 
       - name: Run tests
         run: |
@@ -116,6 +124,11 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - uses: ./.github/actions/adjust-swap-space
 
