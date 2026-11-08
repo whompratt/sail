@@ -120,6 +120,25 @@ jobs:
           name: grcov-${{ matrix.cache }}
           path: out/
 
+      - uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: out/grcov-all.info
+          disable_search: true
+          flags: grcov-${{ matrix.cache }}
+          name: grcov-${{ matrix.cache }}
+          fail_ci_if_error: true
+
+      - uses: codecov/codecov-action@v7
+        if: ${{ matrix.cache == 'warm' }}
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: out/grcov-pruned.info
+          disable_search: true
+          flags: grcov-warm-pruned
+          name: grcov-warm-pruned
+          fail_ci_if_error: true
+
   llvm-cov:
     name: llvm-cov (${{ matrix.cache }})
     runs-on: ubuntu-latest
@@ -197,3 +216,27 @@ jobs:
         with:
           name: llvm-cov-${{ matrix.cache }}
           path: out/
+
+      - uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: out/llvm-cov-build-scripts.info
+          disable_search: true
+          flags: llvm-cov-${{ matrix.cache }}
+          name: llvm-cov-${{ matrix.cache }}
+          fail_ci_if_error: true
+
+  codecov-notify:
+    name: Codecov Notify
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    needs:
+      - grcov
+      - llvm-cov
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: codecov/codecov-action@v7
+        with:
+          run_command: send-notifications
+          token: ${{ secrets.CODECOV_TOKEN }}
