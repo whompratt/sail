@@ -89,21 +89,28 @@ jobs:
             -o out/grcov-all.info
           echo "report_all_seconds=$((SECONDS - start))" >> out/timings.txt
 
-          mkdir -p target/nextest-bins
           cargo nextest list --list-type binaries-only --message-format json > out/nextest-binaries.json
-          jq -r '."rust-suites"[]."binary-path"' out/nextest-binaries.json | xargs -I{} ln -f {} target/nextest-bins/
+          # Remove test binaries left over from other builds of the same test target.
+          jq -r '."rust-binaries"[] | "\(."binary-name")\t\(."binary-path")"' out/nextest-binaries.json \
+            | while IFS=$'\t' read -r name path; do
+                for f in "$(dirname "$path")/$name"-*; do
+                  if [[ -x "$f" && "$(basename "$f")" != *.* && "$f" != "$path" ]]; then
+                    echo "$f" | tee -a out/pruned.txt
+                    rm -f "$f"
+                  fi
+                done
+              done
           start=$SECONDS
-          grcov target/llvm-profiles/rust-unit --binary-path target/nextest-bins/ -s . \
+          grcov target/llvm-profiles/rust-unit --binary-path target/debug/ -s . \
             --llvm-path "$LLVM_PATH" \
             -t lcov --branch --ignore-not-existing \
-            -o out/grcov-exact.info
-          echo "report_exact_seconds=$((SECONDS - start))" >> out/timings.txt
+            -o out/grcov-pruned.info
+          echo "report_pruned_seconds=$((SECONDS - start))" >> out/timings.txt
 
       - name: Record build artefacts
         run: |
           find target/debug/deps -maxdepth 1 -type f -perm -u+x -printf '%TY-%Tm-%Td %TT %s %f\n' | sort -k4 > out/executables.txt
-          ls target/nextest-bins > out/nextest-bins.txt
-          wc -l out/executables.txt out/nextest-bins.txt
+          wc -l out/executables.txt
           grep sail_telemetry out/executables.txt || true
           du -sh target/ | tee -a out/timings.txt
           cat out/timings.txt
