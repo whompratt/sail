@@ -66,6 +66,20 @@ impl JobGraph {
             distribution: OutputDistribution::RoundRobinBatch { channels: 1 },
             placement: TaskPlacement::Worker,
         });
+        // Shuffle writes wait for every reader, so two inputs reading one stage
+        // would deadlock if one were read only after the other finished.
+        debug_assert!(
+            (0..graph.stages.len()).all(|stage| {
+                graph
+                    .stages
+                    .iter()
+                    .flat_map(|x| &x.inputs)
+                    .filter(|input| input.stage == stage)
+                    .count()
+                    <= 1
+            }),
+            "a stage must be read by at most one stage input"
+        );
         Ok(graph)
     }
 }

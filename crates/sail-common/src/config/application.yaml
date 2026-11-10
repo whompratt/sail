@@ -238,7 +238,7 @@
 - key: cluster.task_stream_buffer
   type: number
   default: "16"
-  description: The number of batches to buffer in the task stream.
+  description: The number of batches to buffer for each reader of a task stream before the writer waits.
   experimental: true
 
 - key: cluster.task_stream_creation_timeout_secs
