@@ -54,17 +54,39 @@ def test_shuffle_finishes_when_join_leaves_probe_partitions_unread(spark, partit
 
 
 @pytest.mark.timeout(30)
-def test_shuffle_finishes_when_union_leaves_merge_replicas_unread(spark):
+@pytest.mark.parametrize("consumer", ["sum", "sort"])
+def test_shuffle_finishes_when_union_leaves_merge_replicas_unread(spark, consumer):
     # The sorted branch is a single partition read through a merge input, which
-    # keeps a replica for every union partition although only one of them reads it.
+    # only one union partition reaches. The global sort merges the union partitions
+    # in order, so it stops reading the others while it waits for the sorted branch.
     # Multiple range batches overflow the one-batch shuffle buffers.
     rows, limit = 10_000, 5_000
     top = spark.range(rows, numPartitions=4).orderBy("id").limit(limit)
     even = spark.range(rows, numPartitions=4).filter("id % 2 = 0")
+    union = top.union(even)
 
-    total = top.union(even).groupBy().sum("id").collect()[0][0]
+    if consumer == "sum":
+        assert union.groupBy().sum("id").collect()[0][0] == sum(range(limit)) + sum(range(0, rows, 2))
+    else:
+        ids = [row.id for row in union.orderBy("id").collect()]
+        assert ids == sorted([*range(limit), *range(0, rows, 2)])
 
-    assert total == sum(range(limit)) + sum(range(0, rows, 2))
+
+@pytest.mark.timeout(30)
+def test_shuffle_finishes_when_sorted_union_is_projected(spark):
+    # The projection over the union keeps the union and its sorted branch in one stage.
+    rows, limit = 10_000, 5_000
+    query = f"""
+        SELECT k FROM (
+          SELECT * FROM (SELECT id AS k FROM range(0, {rows}, 1, 4) ORDER BY id LIMIT {limit})
+          UNION ALL
+          SELECT id AS k FROM range(0, {rows}, 1, 4) WHERE id % 2 = 0
+        ) ORDER BY k
+    """
+
+    ids = [row.k for row in spark.sql(query).collect()]
+
+    assert ids == sorted([*range(limit), *range(0, rows, 2)])
 
 
 @pytest.mark.timeout(15)

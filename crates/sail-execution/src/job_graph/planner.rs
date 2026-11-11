@@ -17,6 +17,7 @@ use datafusion::physical_plan::repartition::RepartitionExec;
 use datafusion::physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqueryLink};
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
+use datafusion::physical_plan::union::UnionExec;
 use datafusion::physical_plan::{
     ExecutionPlan, ExecutionPlanProperties, PlanProperties, replace_children_if_necessary,
 };
@@ -66,22 +67,47 @@ impl JobGraph {
             distribution: OutputDistribution::RoundRobinBatch { channels: 1 },
             placement: TaskPlacement::Worker,
         });
-        // Shuffle writes wait for every reader, so two inputs reading one stage
-        // would deadlock if one were read only after the other finished.
-        debug_assert!(
-            (0..graph.stages.len()).all(|stage| {
-                graph
-                    .stages
-                    .iter()
-                    .flat_map(|x| &x.inputs)
-                    .filter(|input| input.stage == stage)
-                    .count()
-                    <= 1
-            }),
-            "a stage must be read by at most one stage input"
-        );
+        check_stage_inputs(&graph)?;
         Ok(graph)
     }
+}
+
+/// Checks that each stage is read by at most one stage input, other than scalar
+/// subquery links.
+///
+/// Shuffle writes wait for every reader, so two inputs reading one stage would deadlock
+/// if one were read only after the other finished. A scalar subquery is read in full
+/// before the input of its [`ScalarSubqueryExec`], so its links cannot hold each other up.
+fn check_stage_inputs(graph: &JobGraph) -> ExecutionResult<()> {
+    // For each stage, whether each input reading it is a scalar subquery link.
+    let mut readers = vec![vec![]; graph.stages.len()];
+    for stage in &graph.stages {
+        let mut links = vec![];
+        stage.plan.apply(|node| {
+            if let Some(scalar) = node.downcast_ref::<ScalarSubqueryExec>() {
+                links.extend(scalar.subqueries().iter().filter_map(|link| {
+                    link.plan
+                        .downcast_ref::<StageInputExec<usize>>()
+                        .map(|input| *input.input())
+                }));
+            }
+            Ok(TreeNodeRecursion::Continue)
+        })?;
+        for (index, input) in stage.inputs.iter().enumerate() {
+            if let Some(readers) = readers.get_mut(input.stage) {
+                readers.push(links.contains(&index));
+            }
+        }
+    }
+    for (stage, readers) in readers.iter().enumerate() {
+        if readers.len() > 1 && !readers.iter().all(|link| *link) {
+            return Err(ExecutionError::InternalError(format!(
+                "stage {stage} is read by {} stage inputs, but at most one is supported",
+                readers.len()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn ensure_worker_input_for_lake_procedure(
@@ -625,6 +651,29 @@ fn plan_job_graph_stages(
             vec![create_merge_input(child, graph, scalar_context)?],
         )?;
         PlannedSubtree::new(plan, subtree.node_has_scalar_subquery_expr)
+    } else if subtree.plan.is::<UnionExec>() {
+        // Each union partition executes one child, so the tasks for the other children
+        // never read their replicas of a merge or broadcast input under this child. The
+        // producer would wait on those replicas while the reading task waits on the
+        // producer. As its own stage, the child is read through one stream per partition.
+        let mut pending = subtree.node_has_scalar_subquery_expr;
+        let mut children = vec![];
+        for (child, &child_pending) in subtree
+            .plan
+            .children()
+            .into_iter()
+            .zip(&subtree.child_has_pending_scalar_subquery_expr)
+        {
+            if reads_pipelined_replicated_input(child, graph)? {
+                let child = PlannedSubtree::new(Arc::clone(child), child_pending);
+                children.push(create_forward_input(child, graph, scalar_context)?);
+            } else {
+                pending |= child_pending;
+                children.push(Arc::clone(child));
+            }
+        }
+        let plan = replace_children_if_necessary(subtree.plan.clone(), children)?;
+        PlannedSubtree::new(plan, pending)
     } else if let Some(coalesce) = subtree.plan.downcast_ref::<CoalesceExec>() {
         let child = subtree.only_child()?;
         let plan =
@@ -857,6 +906,42 @@ fn create_merge_input(
         OutputMode::Pipelined,
     )?;
     Ok(stage_input_exec(stage, InputMode::Merge, properties))
+}
+
+/// Returns whether the plan reads a merge or broadcast input whose producer streams its
+/// output while it is read.
+fn reads_pipelined_replicated_input(
+    plan: &Arc<dyn ExecutionPlan>,
+    graph: &JobGraph,
+) -> ExecutionResult<bool> {
+    Ok(plan.exists(|node| {
+        Ok(node
+            .downcast_ref::<StageInputExec<StageInput>>()
+            .is_some_and(|x| {
+                matches!(x.input().mode, InputMode::Merge | InputMode::Broadcast)
+                    && graph
+                        .stages
+                        .get(x.input().stage)
+                        .is_some_and(|stage| matches!(stage.mode, OutputMode::Pipelined))
+            }))
+    })?)
+}
+
+fn create_forward_input(
+    plan: PlannedSubtree,
+    graph: &mut JobGraph,
+    scalar_context: Option<ScalarSubqueryContext<'_>>,
+) -> ExecutionResult<Arc<dyn ExecutionPlan>> {
+    let properties = plan.plan.properties().clone();
+    let plan = wrap_pending_scalar_subqueries(plan, scalar_context);
+    let stage = push_stage(
+        plan,
+        graph,
+        OutputDistribution::RoundRobinBatch { channels: 1 },
+        TaskPlacement::Worker,
+        OutputMode::Pipelined,
+    )?;
+    Ok(stage_input_exec(stage, InputMode::Forward, properties))
 }
 
 fn create_scalar_subquery_input(
@@ -1106,9 +1191,11 @@ mod tests {
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode};
     use datafusion::physical_plan::limit::GlobalLimitExec;
+    use datafusion::physical_plan::projection::ProjectionExec;
     use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::scalar_subquery::{ScalarSubqueryExec, ScalarSubqueryLink};
     use datafusion::physical_plan::sorts::sort::SortExec;
+    use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMergeExec;
     use datafusion::physical_plan::union::UnionExec;
     use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties, displayable};
     use sail_catalog::command::CatalogCommand;
@@ -1874,6 +1961,43 @@ mod tests {
     }
 
     #[test]
+    fn test_job_graph_allows_scalar_subquery_read_by_several_stages() {
+        let results = ScalarSubqueryResults::new(1);
+        let predicate = || {
+            Arc::new(ScalarSubqueryExpr::new(
+                DataType::Boolean,
+                false,
+                SubqueryIndex::new(0),
+                results.clone(),
+            ))
+        };
+        let filtered = Arc::new(FilterExec::try_new(predicate(), empty_plan()).unwrap());
+        let repartitioned =
+            Arc::new(RepartitionExec::try_new(filtered, Partitioning::RoundRobinBatch(4)).unwrap());
+        let filtered = Arc::new(FilterExec::try_new(predicate(), repartitioned).unwrap());
+        let plan = Arc::new(ScalarSubqueryExec::new(
+            filtered,
+            vec![ScalarSubqueryLink {
+                plan: empty_plan(),
+                index: SubqueryIndex::new(0),
+            }],
+            results.clone(),
+        ));
+
+        let graph = JobGraph::try_new(plan, flight_shuffle_options()).unwrap();
+
+        let readers = graph
+            .stages()
+            .iter()
+            .flat_map(|stage| &stage.inputs)
+            .filter(|input| matches!(input.mode, InputMode::Broadcast))
+            .map(|input| input.stage)
+            .collect::<Vec<_>>();
+        assert_eq!(readers.len(), 2);
+        assert_eq!(readers[0], readers[1]);
+    }
+
+    #[test]
     fn test_job_graph_broadcasts_scalar_subquery_stage_inputs() {
         let results = ScalarSubqueryResults::new(1);
         let predicate = Arc::new(ScalarSubqueryExpr::new(
@@ -1922,5 +2046,97 @@ mod tests {
                 .iter()
                 .any(|input| matches!(input.mode, InputMode::Broadcast))
         );
+    }
+
+    fn sorted_merge(partitions: usize) -> Arc<dyn ExecutionPlan> {
+        let ordering: LexOrdering =
+            [PhysicalSortExpr::new_default(col("id", &schema()).unwrap())].into();
+        let input = UnionExec::try_new(vec![empty_plan(); partitions]).unwrap();
+        let input =
+            Arc::new(SortExec::new(ordering.clone(), input).with_preserve_partitioning(true));
+        Arc::new(SortPreservingMergeExec::new(ordering, input))
+    }
+
+    fn broadcast_join(probe_partitions: usize) -> Arc<dyn ExecutionPlan> {
+        let key = col("id", &schema()).unwrap();
+        let build = CoalescePartitionsExec::new(UnionExec::try_new(vec![empty_plan(); 2]).unwrap());
+        Arc::new(
+            HashJoinExec::try_new(
+                Arc::new(build),
+                UnionExec::try_new(vec![empty_plan(); probe_partitions]).unwrap(),
+                vec![(Arc::clone(&key), key)],
+                None,
+                &JoinType::Inner,
+                Some(vec![0]),
+                PartitionMode::CollectLeft,
+                NullEquality::NullEqualsNothing,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn modes(graph: &JobGraph) -> Vec<String> {
+        graph
+            .stages
+            .iter()
+            .flat_map(|x| &x.inputs)
+            .map(|input| input.mode.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn union_reads_merge_input_through_its_own_stage() {
+        let union = UnionExec::try_new(vec![sorted_merge(4), empty_plan(), empty_plan()]).unwrap();
+        let plan = Arc::new(
+            ProjectionExec::try_new(
+                vec![(col("id", &schema()).unwrap(), "id".to_string())],
+                union,
+            )
+            .unwrap(),
+        );
+        let graph = JobGraph::try_new(plan, flight_shuffle_options()).unwrap();
+        let union_stage = graph.stages.last().unwrap();
+        assert_eq!(union_stage.plan.output_partitioning().partition_count(), 3);
+        assert_eq!(union_stage.inputs.len(), 1);
+        assert!(matches!(union_stage.inputs[0].mode, InputMode::Forward));
+        let branch = &graph.stages[union_stage.inputs[0].stage];
+        assert!(branch.plan.is::<SortPreservingMergeExec>());
+        assert!(matches!(branch.inputs[0].mode, InputMode::Merge));
+    }
+
+    #[test]
+    fn union_reads_broadcast_join_through_its_own_stage() {
+        let plan = UnionExec::try_new(vec![empty_plan(), broadcast_join(3), empty_plan()]).unwrap();
+        let graph = JobGraph::try_new(plan, flight_shuffle_options()).unwrap();
+        let union_stage = graph.stages.last().unwrap();
+        assert_eq!(union_stage.plan.output_partitioning().partition_count(), 5);
+        assert!(
+            union_stage
+                .inputs
+                .iter()
+                .all(|input| matches!(input.mode, InputMode::Forward))
+        );
+        let branch = &graph.stages[union_stage.inputs[0].stage];
+        assert_eq!(branch.plan.output_partitioning().partition_count(), 3);
+        assert!(
+            branch
+                .inputs
+                .iter()
+                .any(|input| matches!(input.mode, InputMode::Broadcast))
+        );
+    }
+
+    #[test]
+    fn broadcast_join_without_union_stays_in_one_stage() {
+        let graph = JobGraph::try_new(broadcast_join(3), flight_shuffle_options()).unwrap();
+        assert!(!modes(&graph).contains(&"Forward".to_string()));
+    }
+
+    #[test]
+    fn union_without_replicated_input_stays_in_one_stage() {
+        let plan = UnionExec::try_new(vec![empty_plan(), empty_plan()]).unwrap();
+        let graph = JobGraph::try_new(plan, flight_shuffle_options()).unwrap();
+        assert_eq!(graph.stages.len(), 1);
     }
 }
