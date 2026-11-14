@@ -10,7 +10,7 @@ use datafusion::arrow::array::{
 use datafusion::arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
 use datafusion::arrow::compute::take;
 use datafusion::arrow::datatypes::{
-    ByteViewType, DataType, Int16Type, Int32Type, Int64Type, RunEndIndexType, Schema,
+    ByteViewType, DataType, Int16Type, Int32Type, Int64Type, RunEndIndexType, Schema, UnionMode,
 };
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::Result;
@@ -46,13 +46,23 @@ fn copy_ranges(array: &ArrayRef, ranges: &[(usize, usize)]) -> Result<ArrayRef> 
         for &(start, end) in ranges {
             copy.try_extend(0, start, end)?;
         }
-        make_array(copy.freeze())
+        let mut copy = make_array(copy.freeze());
+        // `MutableArrayData` reserves a slot per row for the values of runs and for each
+        // child of a union.
+        if contains(array.data_type(), &|t| {
+            matches!(t, DataType::RunEndEncoded(..) | DataType::Union(..))
+        }) && let Some(copy) = Arc::get_mut(&mut copy)
+        {
+            copy.shrink_to_fit();
+        }
+        copy
     };
     trim(copy, true)
 }
 
 /// Drops the view strings, dictionary values, and list view values that an array holds
-/// but mostly does not use, including in its children.
+/// but mostly does not use, including in its children, and the values that a sliced list,
+/// dense union, or run array leaves out.
 ///
 /// When `detach` is set, dictionary and list view values are copied even when all of
 /// them are used, since they may still be shared with the array that was copied.
@@ -67,8 +77,15 @@ pub(super) fn trim(array: ArrayRef, detach: bool) -> Result<ArrayRef> {
                 .map_or(array, |views| Arc::new(views) as ArrayRef))
         }
         DataType::Dictionary(_, _) => trim_dictionary(&array, detach),
+        DataType::List(_) | DataType::Map(_, _) => trim_list::<i32>(array, detach),
+        DataType::LargeList(_) => trim_list::<i64>(array, detach),
         DataType::ListView(_) => trim_list_view::<i32>(array, detach),
         DataType::LargeListView(_) => trim_list_view::<i64>(array, detach),
+        DataType::Union(_, UnionMode::Dense) | DataType::RunEndEncoded(..)
+            if !uses_all_children(&array) =>
+        {
+            copy(&array)
+        }
         data_type if data_type.is_nested() || matches!(data_type, DataType::RunEndEncoded(..)) => {
             trim_children(array, detach)
         }
@@ -95,6 +112,54 @@ fn trim_children(array: ArrayRef, detach: bool) -> Result<ArrayRef> {
     Ok(make_array(
         data.into_builder().child_data(children).build()?,
     ))
+}
+
+/// Trims the values that a list's offsets cover, leaving out the rest of a sliced list's values.
+fn trim_list<O: OffsetSizeTrait>(array: ArrayRef, detach: bool) -> Result<ArrayRef> {
+    let data = array.to_data();
+    let offsets = &data.buffers()[0].typed_data::<O>()[data.offset()..=data.offset() + data.len()];
+    let start = offsets[0].as_usize();
+    let end = offsets[data.len()].as_usize();
+    let values = make_array(data.child_data()[0].slice(start, end - start));
+    let trimmed = trim(Arc::clone(&values), detach)?;
+    if Arc::ptr_eq(&values, &trimmed) {
+        return Ok(array);
+    }
+    let offsets: ScalarBuffer<O> = offsets.iter().map(|&offset| offset - offsets[0]).collect();
+    Ok(make_array(
+        ArrayData::builder(data.data_type().clone())
+            .len(data.len())
+            .nulls(data.nulls().cloned())
+            .add_buffer(offsets.into_inner())
+            .add_child_data(trimmed.to_data())
+            .build()?,
+    ))
+}
+
+/// Returns whether a dense union or run array uses every value of its children,
+/// which slicing leaves in place.
+fn uses_all_children(array: &ArrayRef) -> bool {
+    fn runs<R: RunEndIndexType>(array: &ArrayRef) -> bool {
+        let runs = array.as_run::<R>();
+        if runs.is_empty() {
+            return runs.values().is_empty();
+        }
+        runs.get_start_physical_index() == 0
+            && runs.get_end_physical_index() + 1 == runs.values().len()
+    }
+    match array.data_type() {
+        DataType::Union(_, UnionMode::Dense) => {
+            let data = array.to_data();
+            data.child_data().iter().map(ArrayData::len).sum::<usize>() <= array.len()
+        }
+        DataType::RunEndEncoded(run_ends, _) => match run_ends.data_type() {
+            DataType::Int16 => runs::<Int16Type>(array),
+            DataType::Int32 => runs::<Int32Type>(array),
+            DataType::Int64 => runs::<Int64Type>(array),
+            _ => true,
+        },
+        _ => true,
+    }
 }
 
 /// Copies the bytes that views use into new buffers if they use at most half of their
@@ -414,18 +479,24 @@ fn run_footprint<R: RunEndIndexType>(array: &dyn Array) -> (usize, usize) {
     (held + h, padded(count * size_of::<R::Native>()) + n)
 }
 
+/// Returns whether a type or any type nested in it matches.
+fn contains(data_type: &DataType, matches: &dyn Fn(&DataType) -> bool) -> bool {
+    matches(data_type)
+        || child_types(data_type)
+            .into_iter()
+            .any(|child| contains(child, matches))
+}
+
 /// Returns whether a type has list views, which `MutableArrayData` would copy value by value.
 fn contains_list_view(data_type: &DataType) -> bool {
-    match data_type {
-        DataType::ListView(_) | DataType::LargeListView(_) => true,
-        _ => child_types(data_type).into_iter().any(contains_list_view),
-    }
+    contains(data_type, &|t| {
+        matches!(t, DataType::ListView(_) | DataType::LargeListView(_))
+    })
 }
 
 /// Returns whether a type has dictionaries, which can hold values no key uses.
 pub(super) fn contains_dictionary(data_type: &DataType) -> bool {
-    matches!(data_type, DataType::Dictionary(_, _))
-        || child_types(data_type).into_iter().any(contains_dictionary)
+    contains(data_type, &|t| matches!(t, DataType::Dictionary(_, _)))
 }
 
 /// Returns the types of an array's children, in the order of its child data.

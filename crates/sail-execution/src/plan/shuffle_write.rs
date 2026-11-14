@@ -416,7 +416,7 @@ impl Channel {
             } else {
                 map_columns(batch, compact_input)?
             };
-            return self.push(batch, dictionary_capacities);
+            return self.push(batch, dictionary_capacities, None);
         }
         if large && rows > batch_rows - buffered {
             // The coalescer merges a large batch into a small buffered one rather than passing
@@ -428,7 +428,7 @@ impl Channel {
             while offset < rows {
                 let len = (batch_rows - self.coalescer.get_buffered_rows()).min(rows - offset);
                 let part = map_columns(batch.slice(offset, len), copy_unless_coalesced)?;
-                self.push(part, dictionary_capacities)?;
+                self.push(part, dictionary_capacities, None)?;
                 offset += len;
             }
             self.coalescer
@@ -446,7 +446,7 @@ impl Channel {
                 }
             })?
         };
-        self.push(batch, dictionary_capacities)
+        self.push(batch, dictionary_capacities, Some(pass_through_rows))
     }
 
     /// Adds a batch to the coalescer, first finishing the buffered batch if concatenating
@@ -454,7 +454,15 @@ impl Channel {
     ///
     /// Arrow panics on such an overflow for values it cannot merge. A batch's dictionaries
     /// have been compacted to the values its keys use, so they always fit on their own.
-    fn push(&mut self, batch: RecordBatch, dictionary_capacities: &[usize]) -> Result<()> {
+    ///
+    /// `pass_through_rows` is set for a batch with columns left for the coalescer to copy,
+    /// which must not be passed through when finishing early empties the buffer.
+    fn push(
+        &mut self,
+        batch: RecordBatch,
+        dictionary_capacities: &[usize],
+        pass_through_rows: Option<usize>,
+    ) -> Result<()> {
         if dictionary_capacities.is_empty() {
             return Ok(self.coalescer.push_batch(batch)?);
         }
@@ -465,12 +473,20 @@ impl Channel {
             .zip(&incoming)
             .zip(dictionary_capacities)
             .any(|((buffered, incoming), capacity)| buffered + incoming > *capacity);
-        if overflows && self.coalescer.get_buffered_rows() > 0 {
+        let finished = overflows && self.coalescer.get_buffered_rows() > 0;
+        if finished {
             self.coalescer.finish_buffered_batch()?;
             self.dictionary_values.fill(0);
         }
+        let held = pass_through_rows.filter(|_| finished);
+        if held.is_some() {
+            self.coalescer.set_biggest_coalesce_batch_size(None);
+        }
         let expected = self.coalescer.get_buffered_rows() + batch.num_rows();
         self.coalescer.push_batch(batch)?;
+        if held.is_some() {
+            self.coalescer.set_biggest_coalesce_batch_size(held);
+        }
         let buffered = self.coalescer.get_buffered_rows();
         if buffered == 0 {
             self.dictionary_values.fill(0);
@@ -614,22 +630,30 @@ fn compact_unbounded(
 #[cfg(test)]
 mod tests {
     use std::ops::Range;
+    use std::panic::AssertUnwindSafe;
 
     use datafusion::arrow::array::{
-        Array, ArrayData, AsArray, BooleanArray, ByteView, DictionaryArray, GenericListViewArray,
-        Int8Array, Int16Array, Int32Array, Int64Array, ListArray, ListBuilder, ListViewArray,
-        OffsetSizeTrait, RunArray, StringArray, StringViewArray, StringViewBuilder, StructArray,
-        UInt32Array, make_array,
+        Array, ArrayData, AsArray, BooleanArray, ByteView, DictionaryArray, FixedSizeBinaryArray,
+        FixedSizeListArray, GenericListViewArray, Int8Array, Int16Array, Int32Array, Int64Array,
+        LargeListArray, ListArray, ListBuilder, ListViewArray, MapArray, OffsetSizeTrait, RunArray,
+        StringArray, StringViewArray, StringViewBuilder, StructArray, UInt32Array, UnionArray,
+        make_array,
     };
-    use datafusion::arrow::buffer::{Buffer, NullBuffer};
-    use datafusion::arrow::compute::{cast, concat, concat_batches, take, take_record_batch};
+    use datafusion::arrow::buffer::{Buffer, NullBuffer, OffsetBuffer};
+    use datafusion::arrow::compute::{
+        cast, concat, concat_batches, sort_to_indices, take, take_record_batch,
+    };
     use datafusion::arrow::datatypes::{
-        Field, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef,
+        Field, Int8Type, Int16Type, Int32Type, Int64Type, SchemaRef, UnionFields,
     };
+    use datafusion::common::ScalarValue;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_expr::{PhysicalSortExpr, SplitPoint};
     use datafusion::physical_plan::common::collect;
     use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
+    use datafusion::prelude::SessionConfig;
+    use futures::FutureExt;
     use sail_function::aggregate::array_agg::compact_payload;
     use tokio::sync::Mutex;
 
@@ -1556,6 +1580,434 @@ mod tests {
         let capture = shuffle(stream(&input, true)?, TaskStreamWriteState::Active).await?;
         assert_eq!(capture.writes, input.len());
         assert!(capture.committed);
+        Ok(())
+    }
+
+    /// The column types that the shuffle matrix checks.
+    const MATRIX_KINDS: &[&str] = &[
+        "int64",
+        "boolean",
+        "utf8",
+        "large_binary",
+        "utf8_view",
+        "binary_view",
+        "fixed_size_binary",
+        "dictionary",
+        "narrow_dictionary",
+        "narrow_view_dictionary",
+        "list",
+        "nullable_list",
+        "large_list",
+        "list_view",
+        "shared_list_view",
+        "large_list_view",
+        "fixed_size_list",
+        "struct",
+        "map",
+        "dense_union",
+        "sparse_union",
+        "run_end",
+        "nested_list",
+        "list_of_dictionary",
+        "struct_of_list_view",
+        "list_view_of_narrow_dictionary",
+    ];
+
+    const MATRIX_BATCH_ROWS: usize = 512;
+
+    /// Returns a string for `id` that views hold out of line, and a large one if `heavy`.
+    fn matrix_text(id: usize, heavy: bool) -> String {
+        if heavy {
+            format!("{id:0>1000}")
+        } else {
+            format!("value-{id:020}")
+        }
+    }
+
+    fn matrix_strings(count: usize, base: usize, heavy: &dyn Fn(usize) -> bool) -> StringArray {
+        (0..count)
+            .map(|j| Some(matrix_text(base + j, heavy(j))))
+            .collect()
+    }
+
+    fn matrix_views(count: usize, base: usize, heavy: &dyn Fn(usize) -> bool) -> Result<ArrayRef> {
+        Ok(cast(
+            &matrix_strings(count, base, heavy),
+            &DataType::Utf8View,
+        )?)
+    }
+
+    fn matrix_list(values: ArrayRef, rows: usize, nulls: Option<NullBuffer>) -> Result<ArrayRef> {
+        let per_row = values.len() / rows;
+        let field = Arc::new(Field::new_list_field(values.data_type().clone(), true));
+        Ok(Arc::new(ListArray::try_new(
+            field,
+            OffsetBuffer::from_lengths(std::iter::repeat_n(per_row, rows)),
+            values,
+            nulls,
+        )?))
+    }
+
+    /// Returns list views of two values each, starting `step` values apart.
+    fn matrix_list_view<O: OffsetSizeTrait>(
+        values: ArrayRef,
+        rows: usize,
+        step: usize,
+    ) -> Result<ArrayRef> {
+        let field = Arc::new(Field::new_list_field(values.data_type().clone(), true));
+        Ok(Arc::new(GenericListViewArray::<O>::try_new(
+            field,
+            (0..rows).map(|i| O::usize_as(i * step)).collect(),
+            std::iter::repeat_n(O::usize_as(2), rows).collect(),
+            values,
+            None,
+        )?))
+    }
+
+    /// Returns a dictionary with Int8 keys over 100 values, which differ from batch to batch.
+    fn matrix_narrow_dictionary(count: usize, base: usize, views: bool) -> Result<ArrayRef> {
+        let keys = Int8Array::from_iter_values((0..count).map(|i| (i % 100) as i8));
+        let values: ArrayRef = if views {
+            matrix_views(100, base, &|_| false)?
+        } else {
+            Arc::new(matrix_strings(100, base, &|_| false))
+        };
+        Ok(Arc::new(DictionaryArray::<Int8Type>::try_new(
+            keys, values,
+        )?))
+    }
+
+    /// Returns a column of `kind` whose rows hold large values where `heavy` is set.
+    fn matrix_column(
+        kind: &str,
+        rows: usize,
+        base: usize,
+        heavy: &dyn Fn(usize) -> bool,
+    ) -> Result<ArrayRef> {
+        let pairs = |j: usize| heavy(j / 2);
+        Ok(match kind {
+            "int64" => Arc::new(Int64Array::from_iter_values(
+                (0..rows).map(|i| (base + i) as i64),
+            )),
+            "boolean" => Arc::new(BooleanArray::from_iter(
+                (0..rows).map(|i| Some((base + i).is_multiple_of(3))),
+            )),
+            "utf8" => Arc::new(matrix_strings(rows, base, heavy)),
+            "large_binary" => cast(&matrix_strings(rows, base, heavy), &DataType::LargeBinary)?,
+            "utf8_view" => matrix_views(rows, base, heavy)?,
+            "binary_view" => cast(&matrix_strings(rows, base, heavy), &DataType::BinaryView)?,
+            "fixed_size_binary" => Arc::new(FixedSizeBinaryArray::try_from_iter(
+                (0..rows).map(|i| (base + i).to_le_bytes()),
+            )?),
+            "dictionary" => Arc::new(DictionaryArray::<Int32Type>::try_new(
+                Int32Array::from_iter_values(0..rows as i32),
+                Arc::new(matrix_strings(rows, base, heavy)),
+            )?),
+            "narrow_dictionary" => matrix_narrow_dictionary(rows, base, false)?,
+            "narrow_view_dictionary" => matrix_narrow_dictionary(rows, base, true)?,
+            "list" => matrix_list(matrix_views(2 * rows, 2 * base, &pairs)?, rows, None)?,
+            "nullable_list" => matrix_list(
+                matrix_views(2 * rows, 2 * base, &pairs)?,
+                rows,
+                // Values under null rows are a known limit, so these are small.
+                Some(NullBuffer::from_iter(
+                    (0..rows).map(|i| i % 5 != 0 || heavy(i)),
+                )),
+            )?,
+            "large_list" => {
+                let values = Int64Array::from_iter_values((0..3 * rows).map(|j| j as i64));
+                Arc::new(LargeListArray::try_new(
+                    Arc::new(Field::new_list_field(DataType::Int64, true)),
+                    OffsetBuffer::from_lengths(std::iter::repeat_n(3, rows)),
+                    Arc::new(values),
+                    None,
+                )?)
+            }
+            "list_view" => {
+                matrix_list_view::<i32>(matrix_views(2 * rows, 2 * base, &pairs)?, rows, 2)?
+            }
+            "shared_list_view" => {
+                matrix_list_view::<i32>(matrix_views(rows + 1, base, heavy)?, rows, 1)?
+            }
+            "large_list_view" => {
+                matrix_list_view::<i64>(matrix_views(2 * rows, 2 * base, &pairs)?, rows, 2)?
+            }
+            "fixed_size_list" => {
+                let values = matrix_views(2 * rows, 2 * base, &pairs)?;
+                Arc::new(FixedSizeListArray::try_new(
+                    Arc::new(Field::new_list_field(DataType::Utf8View, true)),
+                    2,
+                    values,
+                    None,
+                )?)
+            }
+            "struct" => Arc::new(StructArray::try_from(vec![
+                ("a", matrix_views(rows, base, heavy)?),
+                (
+                    "b",
+                    Arc::new(Int64Array::from_iter_values(0..rows as i64)) as ArrayRef,
+                ),
+                ("c", Arc::new(matrix_strings(rows, base, heavy)) as ArrayRef),
+            ])?),
+            "map" => {
+                let keys: ArrayRef = Arc::new(StringArray::from_iter_values(
+                    (0..2 * rows).map(|j| format!("key-{}", j % 2)),
+                ));
+                let values = matrix_views(2 * rows, 2 * base, &pairs)?;
+                let entries = StructArray::try_new(
+                    vec![
+                        Field::new("keys", DataType::Utf8, false),
+                        Field::new("values", DataType::Utf8View, true),
+                    ]
+                    .into(),
+                    vec![keys, values],
+                    None,
+                )?;
+                Arc::new(MapArray::try_new(
+                    Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                    OffsetBuffer::from_lengths(std::iter::repeat_n(2, rows)),
+                    entries,
+                    None,
+                    false,
+                )?)
+            }
+            "dense_union" | "sparse_union" => {
+                let fields = UnionFields::try_new(
+                    [0, 1],
+                    [
+                        Field::new("i", DataType::Int64, true),
+                        Field::new("s", DataType::Utf8View, true),
+                    ],
+                )?;
+                let type_ids = (0..rows).map(|i| (i % 2) as i8).collect();
+                if kind == "dense_union" {
+                    let ints =
+                        Int64Array::from_iter_values((0..rows.div_ceil(2)).map(|j| j as i64));
+                    let strings = matrix_views(rows / 2, base, &|j| heavy(2 * j + 1))?;
+                    let offsets = (0..rows).map(|i| (i / 2) as i32).collect();
+                    Arc::new(UnionArray::try_new(
+                        fields,
+                        type_ids,
+                        Some(offsets),
+                        vec![Arc::new(ints), strings],
+                    )?)
+                } else {
+                    let ints = Int64Array::from_iter_values((0..rows).map(|j| j as i64));
+                    let strings = matrix_views(rows, base, heavy)?;
+                    Arc::new(UnionArray::try_new(
+                        fields,
+                        type_ids,
+                        None,
+                        vec![Arc::new(ints), strings],
+                    )?)
+                }
+            }
+            "run_end" => {
+                let runs = rows.div_ceil(4);
+                let run_ends =
+                    Int32Array::from_iter_values((1..=runs).map(|r| (4 * r).min(rows) as i32));
+                let values = matrix_views(runs, base, &|r| heavy(4 * r))?;
+                Arc::new(RunArray::<Int32Type>::try_new(&run_ends, &values)?)
+            }
+            "nested_list" => {
+                let inner = matrix_list(
+                    matrix_views(4 * rows, 4 * base, &|j| heavy(j / 4))?,
+                    2 * rows,
+                    None,
+                )?;
+                matrix_list(inner, rows, None)?
+            }
+            "list_of_dictionary" => {
+                let dictionary = DictionaryArray::<Int16Type>::try_new(
+                    Int16Array::from_iter_values(0..2 * rows as i16),
+                    Arc::new(matrix_strings(2 * rows, 2 * base, &pairs)),
+                )?;
+                matrix_list(Arc::new(dictionary), rows, None)?
+            }
+            "struct_of_list_view" => Arc::new(StructArray::try_from(vec![(
+                "l",
+                matrix_list_view::<i32>(matrix_views(2 * rows, 2 * base, &pairs)?, rows, 2)?,
+            )])?),
+            "list_view_of_narrow_dictionary" => {
+                matrix_list_view::<i32>(matrix_narrow_dictionary(2 * rows, base, true)?, rows, 2)?
+            }
+            _ => unreachable!("unknown column kind {kind}"),
+        })
+    }
+
+    /// Returns batches of the given sizes with a unique key and a column of `kind`.
+    ///
+    /// Skewed batches have a few large rows. Sliced and tail batches are slices of a batch
+    /// whose rows outside the slice are large, covering a quarter or most of it.
+    fn matrix_input(kind: &str, shape: &str, sizes: &[usize]) -> Result<Vec<RecordBatch>> {
+        let mut base = 0;
+        let mut batches = vec![];
+        for &rows in sizes {
+            let (full, heavy): (usize, Box<dyn Fn(usize) -> bool>) = match shape {
+                "whole" => (rows, Box::new(|_| false)),
+                "skewed" => (rows, Box::new(|i| i.is_multiple_of(97))),
+                "tail" => (rows + rows / 8, Box::new(move |i| i >= rows)),
+                _ => (4 * rows, Box::new(move |i| i < rows || i >= 2 * rows)),
+            };
+            let keys = Int64Array::from_iter_values((base..base + full).map(|k| k as i64));
+            let column = matrix_column(kind, full, base, heavy.as_ref())?;
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("k", DataType::Int64, false),
+                Field::new("v", column.data_type().clone(), true),
+            ]));
+            let batch = RecordBatch::try_new(schema, vec![Arc::new(keys), column])?;
+            batches.push(match shape {
+                "sliced" => batch.slice(rows, rows),
+                "tail" => batch.slice(0, rows),
+                _ => batch,
+            });
+            base += full;
+        }
+        Ok(batches)
+    }
+
+    /// Returns a type with its dictionaries replaced by their value types.
+    fn decoded(data_type: &DataType) -> DataType {
+        let field = |field: &Arc<Field>| {
+            Arc::new(
+                field
+                    .as_ref()
+                    .clone()
+                    .with_data_type(decoded(field.data_type())),
+            )
+        };
+        match data_type {
+            DataType::Dictionary(_, values) => decoded(values),
+            DataType::List(f) => DataType::List(field(f)),
+            DataType::LargeList(f) => DataType::LargeList(field(f)),
+            DataType::ListView(f) => DataType::ListView(field(f)),
+            DataType::LargeListView(f) => DataType::LargeListView(field(f)),
+            other => other.clone(),
+        }
+    }
+
+    /// Concatenates batches in key order, decoding dictionaries so that they can be merged.
+    fn matrix_rows(batches: &[RecordBatch]) -> Result<RecordBatch> {
+        let schema = batches[0].schema();
+        let decoded_schema = Arc::new(Schema::new(
+            schema
+                .fields()
+                .iter()
+                .map(|f| f.as_ref().clone().with_data_type(decoded(f.data_type())))
+                .collect::<Vec<_>>(),
+        ));
+        let batches = batches
+            .iter()
+            .map(|batch| {
+                let columns = batch
+                    .columns()
+                    .iter()
+                    .zip(decoded_schema.fields())
+                    .map(|(column, field)| cast(column, field.data_type()))
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                Ok(RecordBatch::try_new(Arc::clone(&decoded_schema), columns)?)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let all = concat_batches(&decoded_schema, &batches)?;
+        let indices = sort_to_indices(all.column(0), None, None)?;
+        Ok(take_record_batch(&all, &indices)?)
+    }
+
+    async fn check_matrix_case(
+        input: &[RecordBatch],
+        scheme: &str,
+        channels: usize,
+        unbounded: bool,
+    ) -> Result<()> {
+        let schema = input[0].schema();
+        let key = col("k", &schema)?;
+        let partitioning = match scheme {
+            "hash" => ShufflePartitioning::Hash(vec![key], channels),
+            "range" => {
+                let mut keys: Vec<i64> = input
+                    .iter()
+                    .flat_map(|b| b.column(0).as_primitive::<Int64Type>().values().to_vec())
+                    .collect();
+                keys.sort_unstable();
+                let points = (1..channels)
+                    .map(|i| {
+                        SplitPoint::new(vec![ScalarValue::Int64(Some(
+                            keys[i * keys.len() / channels],
+                        ))])
+                    })
+                    .collect();
+                ShufflePartitioning::Range(RangePartitioning::try_new(
+                    [PhysicalSortExpr::new_default(key)].into(),
+                    points,
+                )?)
+            }
+            "round_robin_batch" => ShufflePartitioning::RoundRobinBatch(channels),
+            _ => ShufflePartitioning::RoundRobinRow(channels),
+        };
+        let capture = Arc::new(Mutex::new(Capture::default()));
+        let writer = Arc::new(CaptureWriter {
+            capture: Arc::clone(&capture),
+            state: TaskStreamWriteState::Active,
+        });
+        let exec = ShuffleWriteExec::new(stream(input, unbounded)?, writer, partitioning);
+        let context = TaskContext::default()
+            .with_session_config(SessionConfig::new().with_batch_size(MATRIX_BATCH_ROWS));
+        collect(exec.execute(0, Arc::new(context))?).await?;
+        let capture = std::mem::take(&mut *capture.lock().await);
+        let output: Vec<RecordBatch> = capture.channels.iter().flatten().cloned().collect();
+        if matrix_rows(&output)? != matrix_rows(input)? {
+            return plan_err!("output rows differ from the input");
+        }
+        for (channel, output) in capture.channels.iter().enumerate() {
+            assert_compact(channel, output)?;
+        }
+        Ok(())
+    }
+
+    /// Checks every column type through every partitioning scheme and coalescing path.
+    #[tokio::test]
+    async fn shuffle_output_is_compact_for_every_type_and_path() -> Result<()> {
+        let sizes: [&[usize]; 3] = [
+            &[60; 10],
+            &[60, 300, 90, 700, 40, 1500, 200, 520, 30, 260],
+            &[1500, 2600, 1100],
+        ];
+        let mut failures = vec![];
+        for kind in MATRIX_KINDS {
+            for shape in ["whole", "skewed", "sliced", "tail"] {
+                for (s, sizes) in sizes.iter().enumerate() {
+                    let input = matrix_input(kind, shape, sizes)?;
+                    for scheme in ["hash", "range", "round_robin_batch", "round_robin_row"] {
+                        for channels in [1, 3] {
+                            for unbounded in [false, true] {
+                                let case = check_matrix_case(&input, scheme, channels, unbounded);
+                                let error = match AssertUnwindSafe(case).catch_unwind().await {
+                                    Ok(Ok(())) => continue,
+                                    Ok(Err(error)) => error.to_string(),
+                                    Err(panic) => panic
+                                        .downcast_ref::<String>()
+                                        .cloned()
+                                        .or_else(|| {
+                                            panic.downcast_ref::<&str>().map(|s| s.to_string())
+                                        })
+                                        .unwrap_or_default(),
+                                };
+                                failures.push(format!(
+                                    "{kind} {shape} sizes{s} {scheme}({channels}) unbounded={unbounded}: {}",
+                                    error.lines().next().unwrap_or_default()
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} cases failed:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
         Ok(())
     }
 }
